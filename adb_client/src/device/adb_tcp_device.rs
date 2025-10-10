@@ -1,28 +1,73 @@
 use std::io::Write;
 use std::path::Path;
+use std::path::PathBuf;
+use std::time::Duration;
 use std::{io::Read, net::SocketAddr};
 
-use super::ADBTransportMessage;
 use super::adb_message_device::ADBMessageDevice;
 use super::models::MessageCommand;
-use crate::{ADBDeviceExt, ADBMessageTransport, ADBTransport, Result, TcpTransport};
+use super::ADBTransportMessage;
+use super::{get_default_adb_key_path, read_adb_private_key, ADBRsaKey};
+use crate::device::adb_transport_message::{AUTH_RSAPUBLICKEY, AUTH_SIGNATURE, AUTH_TOKEN};
+use crate::{ADBDeviceExt, ADBMessageTransport, ADBTransport, Result, RustADBError, TcpTransport};
 
-/// Represent a device reached and available over USB.
+/// Represent a device reached and available over TCP.
 #[derive(Debug)]
 pub struct ADBTcpDevice {
+    private_key: ADBRsaKey,
     inner: ADBMessageDevice<TcpTransport>,
 }
 
 impl ADBTcpDevice {
     /// Instantiate a new [`ADBTcpDevice`]
     pub fn new(address: SocketAddr) -> Result<Self> {
-        let mut device = Self {
-            inner: ADBMessageDevice::new(TcpTransport::new(address)?),
+        Self::new_with_custom_private_key(address, get_default_adb_key_path()?)
+    }
+
+    /// Instantiate a new [`ADBTcpDevice`] using a custom private key path
+    pub fn new_with_custom_private_key(
+        address: SocketAddr,
+        private_key_path: PathBuf,
+    ) -> Result<Self> {
+        Self::new_from_transport_inner(TcpTransport::new(address)?, private_key_path)
+    }
+
+    /// Instantiate a new [`ADBTcpDevice`] from a [`TcpTransport`] and an optional private key path.
+    pub fn new_from_transport(
+        transport: TcpTransport,
+        private_key_path: Option<PathBuf>,
+    ) -> Result<Self> {
+        let private_key_path = match private_key_path {
+            Some(private_key_path) => private_key_path,
+            None => get_default_adb_key_path()?,
         };
 
-        device.connect()?;
+        Self::new_from_transport_inner(transport, private_key_path)
+    }
 
-        Ok(device)
+    fn new_from_transport_inner(
+        transport: TcpTransport,
+        private_key_path: PathBuf,
+    ) -> Result<Self> {
+        let private_key = match read_adb_private_key(&private_key_path)? {
+            Some(pk) => pk,
+            None => {
+                log::warn!(
+                    "No private key found at path {}. Using a temporary random one.",
+                    private_key_path.display()
+                );
+                ADBRsaKey::new_random()?
+            }
+        };
+
+        let mut s = Self {
+            private_key,
+            inner: ADBMessageDevice::new(transport),
+        };
+
+        s.connect()?;
+
+        Ok(s)
     }
 
     /// Send initial connect
@@ -47,17 +92,101 @@ impl ADBTcpDevice {
                     .write_message(ADBTransportMessage::new(MessageCommand::Stls, 1, 0, &[]))?;
                 self.get_transport_mut().upgrade_connection()?;
                 log::debug!("Connection successfully upgraded from TCP to TLS");
+
+                // After TLS upgrade, send CNXN again and check for authentication
+                let message = ADBTransportMessage::new(
+                    MessageCommand::Cnxn,
+                    0x01000000,
+                    1048576,
+                    format!("host::{}\0", env!("CARGO_PKG_NAME")).as_bytes(),
+                );
+                self.get_transport_mut().write_message(message)?;
+                let message = self.get_transport_mut().read_message()?;
+
+                // After TLS, device might require authentication or accept connection
+                match message.header().command() {
+                    MessageCommand::Cnxn => {
+                        log::debug!("Secure connection established without authentication");
+                        return Ok(());
+                    }
+                    MessageCommand::Auth => {
+                        // Continue to authentication flow below
+                        self.handle_authentication(message)?;
+                    }
+                    _ => {
+                        return Err(RustADBError::WrongResponseReceived(
+                            "Expected CNXN or AUTH command after TLS upgrade".to_string(),
+                            message.header().command().to_string(),
+                        ));
+                    }
+                }
             }
             MessageCommand::Cnxn => {
-                log::debug!("Unencrypted connection established");
+                log::debug!("Unencrypted connection established without authentication");
+                return Ok(());
+            }
+            MessageCommand::Auth => {
+                log::debug!("Authentication required");
+                self.handle_authentication(message)?;
             }
             _ => {
-                return Err(crate::RustADBError::WrongResponseReceived(
-                    "Expected CNXN or STLS command".to_string(),
+                return Err(RustADBError::WrongResponseReceived(
+                    "Expected CNXN, AUTH, or STLS command".to_string(),
                     message.header().command().to_string(),
                 ));
             }
         }
+
+        Ok(())
+    }
+
+    /// Handle the authentication flow with the device
+    fn handle_authentication(&mut self, auth_message: ADBTransportMessage) -> Result<()> {
+        // At this point, we should have received an AUTH message with arg0 == 1
+        let auth_message = match auth_message.header().arg0() {
+            AUTH_TOKEN => auth_message,
+            v => {
+                return Err(RustADBError::ADBRequestFailed(format!(
+                    "Received AUTH message with type != 1 ({v})"
+                )));
+            }
+        };
+
+        let sign = self.private_key.sign(auth_message.into_payload())?;
+
+        let message = ADBTransportMessage::new(MessageCommand::Auth, AUTH_SIGNATURE, 0, &sign);
+
+        self.get_transport_mut().write_message(message)?;
+
+        let received_response = self.get_transport_mut().read_message()?;
+
+        if received_response.header().command() == MessageCommand::Cnxn {
+            log::info!(
+                "Authentication OK, device info {}",
+                String::from_utf8(received_response.into_payload())?
+            );
+            return Ok(());
+        }
+
+        let mut pubkey = self.private_key.android_pubkey_encode()?.into_bytes();
+        pubkey.push(b'\0');
+
+        let message = ADBTransportMessage::new(MessageCommand::Auth, AUTH_RSAPUBLICKEY, 0, &pubkey);
+
+        self.get_transport_mut().write_message(message)?;
+
+        let response = self
+            .get_transport_mut()
+            .read_message_with_timeout(Duration::from_secs(10))
+            .and_then(|message| {
+                message.assert_command(MessageCommand::Cnxn)?;
+                Ok(message)
+            })?;
+
+        log::info!(
+            "Authentication OK, device info {}",
+            String::from_utf8(response.into_payload())?
+        );
 
         Ok(())
     }
