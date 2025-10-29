@@ -1,10 +1,10 @@
 use std::io::{ErrorKind, Read, Write};
 
-use crate::Result;
 use crate::device::ShellMessageWriter;
+use crate::Result;
 use crate::{
-    ADBMessageTransport, RustADBError,
     device::{ADBMessageDevice, ADBTransportMessage, MessageCommand},
+    ADBMessageTransport, RustADBError,
 };
 
 impl<T: ADBMessageTransport> ADBMessageDevice<T> {
@@ -19,13 +19,65 @@ impl<T: ADBMessageTransport> ADBMessageDevice<T> {
             )));
         }
 
+        let local_id = self.get_local_id()?;
+        let remote_id = self.get_remote_id()?;
+
+        // Device "Write" is followed by device "Close" that we need to confirm with a "Close"
+        let mut have_unconfirmed_writes = false;
+
         loop {
             let response = self.get_transport_mut().read_message()?;
-            if response.header().command() != MessageCommand::Write {
-                break;
-            }
 
-            output.write_all(&response.into_payload())?;
+            match response.header().command() {
+                MessageCommand::Write => {
+                    // Send OKAY acknowledgment for more data
+                    let ack =
+                        ADBTransportMessage::new(MessageCommand::Okay, local_id, remote_id, &[]);
+                    self.get_transport_mut().write_message(ack)?;
+
+                    // Write the payload to output
+                    output.write_all(&response.into_payload())?;
+
+                    // Mark that we have unconfirmed writes
+                    have_unconfirmed_writes = true;
+                }
+                MessageCommand::Okay => {
+                    // Device acknowledged our message, continue
+                    continue;
+                }
+                MessageCommand::Clse => {
+                    // Check if this Close is for OUR session
+                    if response.header().arg1() == local_id && response.header().arg0() == remote_id
+                    {
+                        // Close is for our session, acknowledge it by sending Close back
+                        let close_msg = ADBTransportMessage::new(
+                            MessageCommand::Clse,
+                            local_id,
+                            remote_id,
+                            &[],
+                        );
+                        self.get_transport_mut().write_message(close_msg)?;
+
+                        // If we have unconfirmed writes, continue the loop
+                        if have_unconfirmed_writes {
+                            // Reset the flag
+                            have_unconfirmed_writes = false;
+                        } else {
+                            // No unconfirmed writes, meaning we have received the final Close message
+                            break;
+                        }
+                    }
+                    // Close is for a different session, ignore and continue
+                    continue;
+                }
+                _ => {
+                    // Unexpected command
+                    return Err(RustADBError::ADBRequestFailed(format!(
+                        "unexpected command: {}",
+                        response.header().command()
+                    )));
+                }
+            }
         }
 
         Ok(())
